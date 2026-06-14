@@ -1,0 +1,220 @@
+// Prisma schema for the Shared Expenses App.
+// Every model maps 1:1 to a PostgreSQL table.
+// Run `npx prisma migrate dev` to apply changes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum SplitType {
+  equal
+  unequal
+  percentage
+  share
+}
+
+enum ImportStatus {
+  pending
+  complete
+  failed
+}
+
+enum AnomalySeverity {
+  info
+  warning
+  error
+}
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  isGuest      Boolean  @default(false) @map("is_guest")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  groupMemberships GroupMembership[]
+  expensesPaid     Expense[]         @relation("ExpensePaidBy")
+  expenseSplits    ExpenseSplit[]
+  settlementsFrom  Settlement[]      @relation("SettlementFrom")
+  settlementsTo    Settlement[]      @relation("SettlementTo")
+  importSessions   ImportSession[]
+
+  @@map("users")
+}
+
+// ─── Groups ───────────────────────────────────────────────────────────────────
+
+model Group {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  createdById String   @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  memberships    GroupMembership[]
+  expenses       Expense[]
+  settlements    Settlement[]
+  importSessions ImportSession[]
+
+  @@map("groups")
+}
+
+// Tracks when each user joined and optionally left a group.
+// This is how we enforce "Sam wasn't here for March electricity".
+model GroupMembership {
+  id       String    @id @default(uuid())
+  groupId  String    @map("group_id")
+  userId   String    @map("user_id")
+  joinedAt DateTime  @map("joined_at")
+  leftAt   DateTime? @map("left_at") // null means still a member
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId]) // one active membership per user per group
+  @@map("group_memberships")
+}
+
+// ─── Exchange Rates ───────────────────────────────────────────────────────────
+
+// Store manually-entered exchange rates. All balances are computed in INR.
+// The app does NOT call a live FX API — rates are set by an admin/user.
+model ExchangeRate {
+  id            String   @id @default(uuid())
+  fromCurrency  String   @map("from_currency") // e.g. "USD"
+  toCurrency    String   @map("to_currency")   // e.g. "INR"
+  rate          Decimal  @db.Decimal(18, 6)    // e.g. 83.5 means 1 USD = 83.5 INR
+  effectiveDate DateTime @map("effective_date")
+  source        String   @default("manual")    // "manual" or future "api"
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("exchange_rates")
+}
+
+// ─── Expenses ─────────────────────────────────────────────────────────────────
+
+model Expense {
+  id             String    @id @default(uuid())
+  groupId        String    @map("group_id")
+  description    String
+  amount         Decimal   @db.Decimal(18, 2)  // amount in original currency
+  currency       String    @default("INR")      // ISO code: "INR" or "USD"
+  amountInr      Decimal   @map("amount_inr") @db.Decimal(18, 2) // converted to INR
+  paidById       String    @map("paid_by_id")
+  splitType      SplitType @map("split_type")
+  expenseDate    DateTime  @map("expense_date") @db.Date
+  isSettlement   Boolean   @default(false) @map("is_settlement")
+  notes          String?
+  importRowIndex Int?      @map("import_row_index") // null for manually entered expenses
+  createdById    String    @map("created_by_id")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  group    Group          @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  paidBy   User           @relation("ExpensePaidBy", fields: [paidById], references: [id])
+  splits   ExpenseSplit[]
+  anomalies ImportAnomaly[]
+
+  @@map("expenses")
+}
+
+// ─── Expense Splits ───────────────────────────────────────────────────────────
+
+// One row per person per expense. This is where we know exactly who owes what.
+// computedAmountInr is the final INR amount this person owes for this expense.
+model ExpenseSplit {
+  id                 String  @id @default(uuid())
+  expenseId          String  @map("expense_id")
+  userId             String  @map("user_id")
+  // shareValue stores the raw input value:
+  //   equal      → null (computed from total / count)
+  //   unequal    → the fixed INR amount for this person
+  //   percentage → the percentage (e.g. 30.0 for 30%)
+  //   share      → the share units (e.g. 2 for "Rohan 2")
+  shareValue         Decimal? @map("share_value") @db.Decimal(18, 6)
+  computedAmountInr  Decimal  @map("computed_amount_inr") @db.Decimal(18, 2)
+  isSettled          Boolean  @default(false) @map("is_settled")
+
+  expense Expense @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@unique([expenseId, userId]) // a person appears once per expense
+  @@map("expense_splits")
+}
+
+// ─── Settlements ──────────────────────────────────────────────────────────────
+
+// Records a payment from one person to another to settle debts.
+model Settlement {
+  id             String   @id @default(uuid())
+  groupId        String   @map("group_id")
+  paidById       String   @map("paid_by_id")
+  paidToId       String   @map("paid_to_id")
+  amount         Decimal  @db.Decimal(18, 2)
+  currency       String   @default("INR")
+  amountInr      Decimal  @map("amount_inr") @db.Decimal(18, 2)
+  settlementDate DateTime @map("settlement_date") @db.Date
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  group  Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  paidBy User  @relation("SettlementFrom", fields: [paidById], references: [id])
+  paidTo User  @relation("SettlementTo", fields: [paidToId], references: [id])
+
+  @@map("settlements")
+}
+
+// ─── Import Sessions ──────────────────────────────────────────────────────────
+
+// Tracks each CSV import attempt. Anomalies are children of sessions.
+model ImportSession {
+  id           String       @id @default(uuid())
+  groupId      String       @map("group_id")
+  filename     String
+  importedById String       @map("imported_by_id")
+  importedAt   DateTime     @default(now()) @map("imported_at")
+  status       ImportStatus @default(pending)
+  rowCount     Int          @map("row_count")
+  importedCount Int         @default(0) @map("imported_count")
+  skippedCount Int          @default(0) @map("skipped_count")
+  anomalyCount Int          @default(0) @map("anomaly_count")
+
+  group      Group           @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  importedBy User            @relation(fields: [importedById], references: [id])
+  anomalies  ImportAnomaly[]
+
+  @@map("import_sessions")
+}
+
+// Every anomaly detected during import is stored here.
+// The user can see exactly which CSV row caused it and what action was taken.
+// For PENDING rows (severity=error), users can approve or reject via the confirm endpoint.
+model ImportAnomaly {
+  id               String          @id @default(uuid())
+  sessionId        String          @map("session_id")
+  rowIndex         Int             @map("row_index")   // 0-based CSV row number
+  rawRow           Json            @map("raw_row")     // original CSV row as JSON
+  anomalyCode      String          @map("anomaly_code") // e.g. "A1_EXACT_DUPLICATE"
+  severity         AnomalySeverity
+  description      String          // human-readable explanation
+  resolutionPolicy String          @map("resolution_policy") // what the policy says
+  actionTaken      String          @map("action_taken")      // what actually happened
+  resultingExpenseId String?       @map("resulting_expense_id") // if an expense was created
+  // Approval workflow: null = not reviewed, 'approved' = user approved, 'rejected' = user rejected
+  userDecision     String?         @map("user_decision")
+
+  session          ImportSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  resultingExpense Expense?      @relation(fields: [resultingExpenseId], references: [id])
+
+  @@map("import_anomalies")
+}
